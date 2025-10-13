@@ -52,6 +52,7 @@ jobs:
 
       - name: Run ETL
         run: |
+          set -euo pipefail
           python "$GITHUB_WORKSPACE/etl/preprocess_catalog.py" > etl_output.txt
           echo "ETL output paths:"
           cat etl_output.txt
@@ -59,6 +60,7 @@ jobs:
       - name: Parse ETL output paths
         id: paths
         run: |
+          set -euo pipefail
           CATALOG=$(sed -n '1p' etl_output.txt)
           INDEX=$(sed -n '2p' etl_output.txt)
           echo "catalog_path=$CATALOG" >> $GITHUB_OUTPUT
@@ -68,26 +70,36 @@ jobs:
 
       - name: Upload catalog.min.json to Shopify assets
         run: |
+          set -euo pipefail
           FILE_PATH="${{ steps.paths.outputs.catalog_path }}"
           ASSET_KEY="assets/catalog.min.json"
           if [ -n "${ASSETS_PREFIX}" ]; then
             ASSET_KEY="assets/${ASSETS_PREFIX}/catalog.min.json"
           fi
-          B64=$(base64 -w 0 "$FILE_PATH")
-          curl -s -X PUT "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
+          echo "Uploading $FILE_PATH -> $ASSET_KEY"
+          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
+            "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
             -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{\"asset\":{\"key\":\"${ASSET_KEY}\",\"attachment\":\"${B64}\"}}"
+            -d "{\"asset\":{\"key\":\"${ASSET_KEY}\",\"attachment\":\"$(base64 -w 0 "$FILE_PATH")\"}}")
+          echo "HTTP $HTTP_CODE"
+          cat resp.json
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload catalog failed" && exit 1)
 
       - name: Upload index.min.json to Shopify assets
         run: |
+          set -euo pipefail
           FILE_PATH="${{ steps.paths.outputs.index_path }}"
           ASSET_KEY="assets/index.min.json"
           if [ -n "${ASSETS_PREFIX}" ]; then
             ASSET_KEY="assets/${ASSETS_PREFIX}/index.min.json"
           fi
-          B64=$(base64 -w 0 "$FILE_PATH")
-          curl -s -X PUT "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
+          echo "Uploading $FILE_PATH -> $ASSET_KEY"
+          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
+            "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
             -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{\"asset\":{\"key\":\"${ASSET_KEY}\",\"attachment\":\"${B64}\"}}"
+            -d "{\"asset\":{\"key\":\"${ASSET_KEY}\",\"attachment\":\"$(base64 -w 0 "$FILE_PATH")\"}}")
+          echo "HTTP $HTTP_CODE"
+          cat resp.json
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)

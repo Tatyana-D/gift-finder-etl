@@ -21,6 +21,8 @@ jobs:
       THEME_ID: ${{ secrets.THEME_ID }}
       CSV_URL: ${{ github.event.inputs.csv_url || secrets.CSV_URL }}
       ASSETS_PREFIX: ${{ github.event.inputs.assets_prefix || secrets.ASSETS_PREFIX }}
+      INCLUDE_OOS: '1'          # ← на время настройки включаем товары без остатков
+      ALLOW_ZERO_PRICE: '0'     # цену 0 не допускаем (можно поставить '1' для диагностики)
 
     steps:
       - name: Checkout
@@ -102,4 +104,4 @@ jobs:
             -d "{\"asset\":{\"key\":\"${ASSET_KEY}\",\"attachment\":\"$(base64 -w 0 "$FILE_PATH")\"}}")
           echo "HTTP $HTTP_CODE"
           cat resp.json
-          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)
+          test "$HTTP_CODE" -ge 200_

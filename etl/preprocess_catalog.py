@@ -1,12 +1,13 @@
 # etl/preprocess_catalog.py
-import os, json, math, sys
+import os, json, math, sys, re
 import pandas as pd
 from pathlib import Path
 from slugify import slugify
 
 CSV_URL = os.environ.get("CSV_URL")
 ASSETS_PREFIX = os.environ.get("ASSETS_PREFIX", "").strip().strip("/")
-INCLUDE_OOS = os.environ.get("INCLUDE_OOS", "0") == "1"
+INCLUDE_OOS = os.environ.get("INCLUDE_OOS", "0") == "1"          # включать товары даже без остатков
+ALLOW_ZERO_PRICE = os.environ.get("ALLOW_ZERO_PRICE", "0") == "1" # включать варианты с ценой 0 (для диагностики)
 OUT_DIR = Path("./out")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -14,51 +15,69 @@ PERSONAS_PATH = Path(__file__).parent / "personas.json"
 with open(PERSONAS_PATH, "r", encoding="utf-8") as f:
     PERSONA_RULES = json.load(f)
 
-# имена колонок под твой файл
+# колонки под твой CSV
 COL_HANDLE = "Handle"
 COL_TITLE = "Title"
 COL_VENDOR = "Vendor"
 COL_TAGS = "Tags"
-COL_DESC = "Body HTML"              # <- важно
+COL_DESC = "Body HTML"
 COL_IMG = "Image Src"
-COL_PRICE = "Variant Price"
+
+# цена: пробуем по очереди
+PRICE_CANDIDATES = ["Variant Price", "Variant Compare At Price", "Price"]
+
+# остатки
 COL_INV_VAR = "Variant Inventory Qty"
 COL_INV_TOTAL = "Total Inventory Qty"
+COL_INV_POLICY = "Variant Inventory Policy"  # 'continue' / 'deny' / '' ...
+
 COL_VID = "Variant ID"
 COL_VSKU = "Variant SKU"
-COL_OPT1N, COL_OPT1V = "Option1 Name", "Option1 Value"
-COL_OPT2N, COL_OPT2V = "Option2 Name", "Option2 Value"
-COL_OPT3N, COL_OPT3V = "Option3 Name", "Option3 Value"
+COL_OPT1V = "Option1 Value"
+COL_OPT2V = "Option2 Value"
+COL_OPT3V = "Option3 Value"
 
-BUCKETS = [
-    (0, 30, "under_30"),
-    (30, 60, "30_to_60"),
-    (60, 120, "60_to_120"),
-    (120, math.inf, "over_120"),
-]
+BUCKETS = [(0,30,"under_30"), (30,60,"30_to_60"), (60,120,"60_to_120"), (120,math.inf,"over_120")]
 
-def bucket(p):
-    for lo, hi, k in BUCKETS:
+def bucket(p: float) -> str:
+    for lo, hi, key in BUCKETS:
         if lo <= p < hi:
-            return k
+            return key
     return "unknown"
 
-def norm_tags(s):
+def norm_tags(s: str):
     if not s:
         return []
     return [t.strip().lower() for t in s.split(",") if t.strip()]
 
-def ffloat(x):
+_money_re = re.compile(r"[^\d\.,-]")
+def ffloat_any(x) -> float:
+    """Распарсить 59.00 / 59,00 / € 1,299.50 → float"""
+    if x is None:
+        return 0.0
+    s = str(x).strip()
+    if s == "":
+        return 0.0
+    s = _money_re.sub("", s)
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        s = s.replace(",", ".")
     try:
-        if str(x).strip() == "": return 0.0
-        return float(str(x).replace(",", "."))
+        return float(s)
     except:
         return 0.0
 
-def fint(x):
+def fint(x) -> int:
     try:
-        if str(x).strip() == "": return 0
-        return int(float(str(x).replace(",", ".")))
+        s = str(x).strip()
+        if s == "":
+            return 0
+        s = s.replace(",", ".")
+        return int(float(s))
     except:
         return 0
 
@@ -70,6 +89,14 @@ def map_personas(text, tags):
             res.add(persona)
     return sorted(res)
 
+def pick_price(row) -> float:
+    for col in PRICE_CANDIDATES:
+        if col in row and str(row[col]).strip() != "":
+            val = ffloat_any(row[col])
+            if val > 0:
+                return val
+    return ffloat_any(row.get(PRICE_CANDIDATES[0], 0))
+
 def main():
     if not CSV_URL:
         print("Missing CSV_URL", file=sys.stderr)
@@ -79,27 +106,28 @@ def main():
     by_tag, by_persona, by_bucket = {}, {}, {}
     total_rows = total_products = kept_products = kept_variants = 0
 
-    usecols = None  # читаем все, чтобы не потерять поля
-    for chunk in pd.read_csv(CSV_URL, chunksize=50000, dtype=str, keep_default_na=False, usecols=usecols):
+    for chunk in pd.read_csv(CSV_URL, chunksize=50000, dtype=str, keep_default_na=False):
         total_rows += len(chunk)
 
-        # гарантируем существование нужных столбцов
+        # гарантируем наличие колонок
         for c in [COL_HANDLE, COL_TITLE, COL_VENDOR, COL_TAGS, COL_DESC, COL_IMG,
-                  COL_VID, COL_VSKU, COL_OPT1N, COL_OPT1V, COL_OPT2N, COL_OPT2V, COL_OPT3N, COL_OPT3V,
-                  COL_PRICE, COL_INV_VAR, COL_INV_TOTAL]:
+                  COL_VID, COL_VSKU, COL_OPT1V, COL_OPT2V, COL_OPT3V,
+                  COL_INV_VAR, COL_INV_TOTAL, COL_INV_POLICY] + PRICE_CANDIDATES:
             if c not in chunk.columns:
                 chunk[c] = ""
 
-        # приведения типов
-        chunk[COL_PRICE] = chunk[COL_PRICE].apply(ffloat)
+        # нормализация
+        chunk[COL_TAGS] = chunk[COL_TAGS].apply(norm_tags)
         chunk[COL_INV_VAR] = chunk[COL_INV_VAR].apply(fint)
         chunk[COL_INV_TOTAL] = chunk[COL_INV_TOTAL].apply(fint)
-        chunk[COL_TAGS] = chunk[COL_TAGS].apply(norm_tags)
 
         total_products += chunk[COL_HANDLE].nunique()
 
         for handle, rows in chunk.groupby(COL_HANDLE):
-            rows = rows.copy().sort_values(by=[COL_PRICE])
+            rows = rows.copy()
+            rows["_calc_price"] = rows.apply(pick_price, axis=1)
+            rows = rows.sort_values(by=["_calc_price"])
+
             first = rows.iloc[0]
             product_id = slugify(handle) or handle
             title = first[COL_TITLE]
@@ -112,21 +140,28 @@ def main():
             min_price = 9e9
 
             for _, r in rows.iterrows():
-                price = ffloat(r[COL_PRICE])
-                inv_var = fint(r[COL_INV_VAR])
-                inv_total = fint(r[COL_INV_TOTAL])
-                inv = inv_var if inv_var else inv_total  # берём вариант, иначе общий остаток
+                price = float(r["_calc_price"])
 
-                # доступность: есть цена > 0 и (inv > 0 или INCLUDE_OOS)
-                if not (price > 0 and (inv > 0 or INCLUDE_OOS)):
+                # инвентарь и политика
+                policy = (str(r.get(COL_INV_POLICY, "")).strip().lower())
+                inv_var = fint(r.get(COL_INV_VAR))
+                inv_tot = fint(r.get(COL_INV_TOTAL))
+                # приоритет инвентаря: вариант → общий
+                inv = inv_var if inv_var != 0 else inv_tot
+
+                price_ok = (price > 0) or ALLOW_ZERO_PRICE
+                # допускаем:
+                # - inv > 0
+                # - inv == -1 (часто значит "не трекается")
+                # - policy == continue
+                # - либо явно разрешили INCLUDE_OOS
+                inv_ok = (inv > 0) or (inv == -1) or (policy == "continue") or INCLUDE_OOS
+
+                if not (price_ok and inv_ok):
                     continue
 
                 vid = r.get(COL_VID) or r.get(COL_VSKU) or ""
-                opt = " / ".join([
-                    r.get(COL_OPT1V, ""),
-                    r.get(COL_OPT2V, ""),
-                    r.get(COL_OPT3V, "")
-                ]).strip(" /")
+                opt = " / ".join([r.get(COL_OPT1V, ""), r.get(COL_OPT2V, ""), r.get(COL_OPT3V, "")]).strip(" /")
 
                 variants.append({
                     "id": int(vid) if str(vid).isdigit() else vid,
@@ -135,17 +170,17 @@ def main():
                     "inventory": inv
                 })
                 kept_variants += 1
-                if price < min_price:
+                if price > 0 and price < min_price:
                     min_price = price
 
             if not variants:
                 continue
 
-            if min_price == 9e9 and variants:
-                min_price = variants[0]["price"]
+            if min_price == 9e9:
+                min_price = min((v["price"] for v in variants), default=0.0)
 
             personas = map_personas(f"{title} {desc}", tags)
-            p = {
+            product = {
                 "product_id": product_id,
                 "handle": handle,
                 "title": title,
@@ -157,14 +192,13 @@ def main():
                 "primary_image": primary_image,
                 "variants": variants
             }
-            catalog.append(p)
-            kept_products += 1
+            catalog.append(product); kept_products += 1
 
             for t in tags: by_tag.setdefault(t, []).append(product_id)
             for pe in personas: by_persona.setdefault(pe, []).append(product_id)
             by_bucket.setdefault(bucket(min_price), []).append(product_id)
 
-    # запись JSON
+    # запись файлов
     out_catalog = OUT_DIR / "catalog.min.json"
     out_index = OUT_DIR / "index.min.json"
     with open(out_catalog, "w", encoding="utf-8") as f:
@@ -172,10 +206,14 @@ def main():
     with open(out_index, "w", encoding="utf-8") as f:
         json.dump({"by_tag": by_tag, "by_persona": by_persona, "by_price_bucket": by_bucket}, f, ensure_ascii=False, separators=(",", ":"))
 
-    # пути для workflow + краткая сводка
+    # вывод путей для workflow + сводка
     print(str(out_catalog))
     print(str(out_index))
-    print(f"SUMMARY rows={total_rows} products_in_csv={total_products} kept_products={kept_products} kept_variants={kept_variants}", file=sys.stderr)
+    print(
+        f"SUMMARY rows={total_rows} products_in_csv={total_products} kept_products={kept_products} kept_variants={kept_variants} "
+        f"include_oos={INCLUDE_OOS} allow_zero_price={ALLOW_ZERO_PRICE}",
+        file=sys.stderr
+    )
 
 if __name__ == "__main__":
     main()

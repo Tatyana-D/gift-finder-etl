@@ -21,8 +21,8 @@ jobs:
       THEME_ID: ${{ secrets.THEME_ID }}
       CSV_URL: ${{ github.event.inputs.csv_url || secrets.CSV_URL }}
       ASSETS_PREFIX: ${{ github.event.inputs.assets_prefix || secrets.ASSETS_PREFIX }}
-      INCLUDE_OOS: '1'          # ← на время настройки включаем товары без остатков
-      ALLOW_ZERO_PRICE: '0'     # цену 0 не допускаем (можно поставить '1' для диагностики)
+      INCLUDE_OOS: '1'          # включаем товары без явных остатков на период настройки
+      ALLOW_ZERO_PRICE: '0'     # 0-цены не пропускаем (включи '1' для диагностики)
 
     steps:
       - name: Checkout
@@ -45,6 +45,44 @@ jobs:
           ls -la
           ls -la etl || true
           find . -maxdepth 2 -type f -print
+
+      # НОВОЕ: проверяем, что по ссылке реально отдается файл
+      - name: Validate CSV URL
+        run: |
+          set -e
+          echo "CSV_URL=$CSV_URL"
+          echo "---- HEAD ----"
+          curl -sSIL "$CSV_URL" || exit 1
+          echo "---- first 400 bytes ----"
+          curl -sSL "$CSV_URL" | head -c 400 || true
+          echo
+          echo "--------------"
+
+      # НОВОЕ: быстрый предпросмотр колонок и 3 строк
+      - name: Peek CSV (columns + 3 rows)
+        run: |
+          python - << 'PY'
+          import os, pandas as pd
+          url = os.environ['CSV_URL']
+          try:
+            df = pd.read_csv(url, nrows=3, dtype=str, keep_default_na=False, sep=None, engine="python", on_bad_lines="skip")
+            ok = True
+          except Exception as e:
+            print("read_csv failed:", e)
+            ok = False
+          if not ok:
+            try:
+              df = pd.read_excel(url, dtype=str).head(3)
+              ok = True
+            except Exception as e:
+              print("read_excel failed:", e)
+              ok = False
+          if ok and not df.empty:
+            print("COLUMNS:", list(df.columns))
+            print(df.to_string(index=False))
+          else:
+            print("CSV preview empty or failed.")
+          PY
 
       - name: Verify env + ETL exists
         run: |
@@ -104,4 +142,4 @@ jobs:
             -d "{\"asset\":{\"key\":\"${ASSET_KEY}\",\"attachment\":\"$(base64 -w 0 "$FILE_PATH")\"}}")
           echo "HTTP $HTTP_CODE"
           cat resp.json
-          test "$HTTP_CODE" -ge 200_
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)

@@ -1,3 +1,41 @@
+name: Build catalog
+
+on:
+  workflow_dispatch:
+    inputs:
+      csv_url:
+        description: 'Optional CSV URL override'
+        required: false
+      assets_prefix:
+        description: 'Optional assets prefix like giftfinder'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+      SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
+      THEME_ID: ${{ secrets.THEME_ID }}
+      CSV_URL: ${{ github.event.inputs.csv_url || secrets.CSV_URL }}
+      ASSETS_PREFIX: ${{ github.event.inputs.assets_prefix || secrets.ASSETS_PREFIX }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r etl/requirements.txt
+
       - name: Show repo tree
         run: |
           echo "Workspace: $GITHUB_WORKSPACE"
@@ -6,11 +44,50 @@
           ls -la etl || true
           find . -maxdepth 2 -type f -print
 
-      - name: Verify ETL exists
+      - name: Verify env + ETL exists
         run: |
+          test -n "$CSV_URL" || (echo "ERROR: CSV_URL is empty. Set repository secret CSV_URL or pass input." && exit 1)
           test -f etl/preprocess_catalog.py || (echo "ERROR: etl/preprocess_catalog.py not found" && exit 1)
+          test -f etl/personas.json || (echo "ERROR: etl/personas.json not found" && exit 1)
 
       - name: Run ETL
         run: |
           python "$GITHUB_WORKSPACE/etl/preprocess_catalog.py" > etl_output.txt
+          echo "ETL output paths:"
           cat etl_output.txt
+
+      - name: Parse ETL output paths
+        id: paths
+        run: |
+          CATALOG=$(sed -n '1p' etl_output.txt)
+          INDEX=$(sed -n '2p' etl_output.txt)
+          echo "catalog_path=$CATALOG" >> $GITHUB_OUTPUT
+          echo "index_path=$INDEX" >> $GITHUB_OUTPUT
+          test -f "$CATALOG" || (echo "ERROR: catalog.min.json not produced at $CATALOG" && exit 1)
+          test -f "$INDEX" || (echo "ERROR: index.min.json not produced at $INDEX" && exit 1)
+
+      - name: Upload catalog.min.json to Shopify assets
+        run: |
+          FILE_PATH="${{ steps.paths.outputs.catalog_path }}"
+          ASSET_KEY="assets/catalog.min.json"
+          if [ -n "${ASSETS_PREFIX}" ]; then
+            ASSET_KEY="assets/${ASSETS_PREFIX}/catalog.min.json"
+          fi
+          B64=$(base64 -w 0 "$FILE_PATH")
+          curl -s -X PUT "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
+            -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"asset\":{\"key\":\"${ASSET_KEY}\",\"attachment\":\"${B64}\"}}"
+
+      - name: Upload index.min.json to Shopify assets
+        run: |
+          FILE_PATH="${{ steps.paths.outputs.index_path }}"
+          ASSET_KEY="assets/index.min.json"
+          if [ -n "${ASSETS_PREFIX}" ]; then
+            ASSET_KEY="assets/${ASSETS_PREFIX}/index.min.json"
+          fi
+          B64=$(base64 -w 0 "$FILE_PATH")
+          curl -s -X PUT "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
+            -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"asset\":{\"key\":\"${ASSET_KEY}\",\"attachment\":\"${B64}\"}}"

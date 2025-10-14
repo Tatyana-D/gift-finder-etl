@@ -1,12 +1,12 @@
-import os, json, math, sys, re
+import os, json, math, sys, re, io
 import pandas as pd
 from pathlib import Path
 from slugify import slugify
 
 CSV_URL = os.environ.get("CSV_URL")
 ASSETS_PREFIX = os.environ.get("ASSETS_PREFIX", "").strip().strip("/")
-INCLUDE_OOS = os.environ.get("INCLUDE_OOS", "0") == "1"           # включать варианты даже без остатков
-ALLOW_ZERO_PRICE = os.environ.get("ALLOW_ZERO_PRICE", "0") == "1" # допускать нулевую цену (для диагностики)
+INCLUDE_OOS = os.environ.get("INCLUDE_OOS", "0") == "1"
+ALLOW_ZERO_PRICE = os.environ.get("ALLOW_ZERO_PRICE", "0") == "1"
 OUT_DIR = Path("./out")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -14,7 +14,7 @@ PERSONAS_PATH = Path(__file__).parent / "personas.json"
 with open(PERSONAS_PATH, "r", encoding="utf-8") as f:
     PERSONA_RULES = json.load(f)
 
-# Колонки под твой CSV
+# ---- column names (под твой экспорт) ----
 COL_HANDLE = "Handle"
 COL_TITLE = "Title"
 COL_VENDOR = "Vendor"
@@ -22,13 +22,11 @@ COL_TAGS = "Tags"
 COL_DESC = "Body HTML"
 COL_IMG = "Image Src"
 
-# Цена: пробуем последовательно
 PRICE_CANDIDATES = ["Variant Price", "Variant Compare At Price", "Price"]
 
-# Остатки
 COL_INV_VAR = "Variant Inventory Qty"
 COL_INV_TOTAL = "Total Inventory Qty"
-COL_INV_POLICY = "Variant Inventory Policy"  # continue/deny/...
+COL_INV_POLICY = "Variant Inventory Policy"
 
 COL_VID = "Variant ID"
 COL_VSKU = "Variant SKU"
@@ -38,24 +36,22 @@ COL_OPT3V = "Option3 Value"
 
 BUCKETS = [(0,30,"under_30"), (30,60,"30_to_60"), (60,120,"60_to_120"), (120,math.inf,"over_120")]
 
-def bucket(p: float) -> str:
-    for lo, hi, k in BUCKETS:
+def bucket(p):
+    for lo,hi,k in BUCKETS:
         if lo <= p < hi: return k
     return "unknown"
 
-def norm_tags(s: str):
+def norm_tags(s):
     if not s: return []
     return [t.strip().lower() for t in s.split(",") if t.strip()]
 
 _money_re = re.compile(r"[^\d\.,-]")
-def ffloat_any(x) -> float:
-    """Парсит 59.00 / 59,00 / € 1,299.50 → float"""
+def ffloat_any(x):
     if x is None: return 0.0
     s = str(x).strip()
     if s == "": return 0.0
     s = _money_re.sub("", s)
     if "," in s and "." in s:
-        # последний разделитель считаем десятичным
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
@@ -67,7 +63,7 @@ def ffloat_any(x) -> float:
     except:
         return 0.0
 
-def fint(x) -> int:
+def fint(x):
     try:
         s = str(x).strip()
         if s == "": return 0
@@ -84,24 +80,58 @@ def map_personas(text, tags):
             res.add(persona)
     return sorted(res)
 
-def pick_price(row) -> float:
+def pick_price(row):
     for col in PRICE_CANDIDATES:
         if col in row and str(row[col]).strip() != "":
-            val = ffloat_any(row[col])
-            if val > 0:
-                return val
+            val = ffloat_any(row[col]);
+            if val > 0: return val
     return ffloat_any(row.get(PRICE_CANDIDATES[0], 0))
 
-# === НОВОЕ: универсальный итератор по входному файлу (CSV с авто-sep или Excel) ===
+# -------- NEW: автоопределение формата Shopify CSV ----------
+def _read_head_bytes(path_or_url, n=4096):
+    # локальный файл?
+    if os.path.isfile(path_or_url):
+        with open(path_or_url, "rb") as f:
+            return f.read(n)
+    # URL
+    try:
+        import urllib.request
+        with urllib.request.urlopen(path_or_url) as r:
+            return r.read(n)
+    except Exception:
+        return b""
+
+def guess_csv_params(path_or_url):
+    """Возвращает dict с параметрами для pd.read_csv: sep, skiprows."""
+    head = _read_head_bytes(path_or_url).decode("utf-8", errors="ignore")
+    lines = head.splitlines()
+    sep = None
+    skiprows = 0
+
+    # Shopify CSV часто начинаетcя строкой 'Products'
+    if lines and lines[0].strip().lower().startswith("products"):
+        skiprows = 1
+
+    # Заголовок обычно во второй строке, если была 'Products'
+    header_line = lines[skiprows] if len(lines) > skiprows else ""
+    if ";" in header_line and "," not in header_line:
+        sep = ";"
+    else:
+        sep = None  # пусть pandas сам попробует
+
+    return {"sep": sep, "skiprows": skiprows}
+
 def iter_frames(url):
-    # CSV с автоопределением разделителя; пропускаем плохие строки
+    # сначала пробуем как CSV с угаданными параметрами
+    params = guess_csv_params(url)
     try:
         for chunk in pd.read_csv(
             url,
             chunksize=50000,
             dtype=str,
             keep_default_na=False,
-            sep=None,
+            sep=params["sep"],
+            skiprows=params["skiprows"],
             engine="python",
             on_bad_lines="skip"
         ):
@@ -109,7 +139,7 @@ def iter_frames(url):
         return
     except Exception as e:
         print(f"[info] read_csv failed, trying Excel: {e}", file=sys.stderr)
-    # Excel fallback (без чанков)
+    # fallback: Excel
     try:
         xls = pd.read_excel(url, dtype=str)
         yield xls
@@ -117,6 +147,7 @@ def iter_frames(url):
     except Exception as e:
         print(f"[error] read_excel failed: {e}", file=sys.stderr)
         return
+# ------------------------------------------------------------
 
 def main():
     if not CSV_URL:
@@ -132,17 +163,16 @@ def main():
         any_rows = True
         total_rows += len(chunk)
 
-        # гарантируем наличие нужных колонок
         must_cols = [
             COL_HANDLE, COL_TITLE, COL_VENDOR, COL_TAGS, COL_DESC, COL_IMG,
             COL_VID, COL_VSKU, COL_OPT1V, COL_OPT2V, COL_OPT3V,
             COL_INV_VAR, COL_INV_TOTAL, COL_INV_POLICY
         ] + PRICE_CANDIDATES
+
         for c in must_cols:
             if c not in chunk.columns:
                 chunk[c] = ""
 
-        # нормализация типов
         chunk[COL_TAGS] = chunk[COL_TAGS].apply(norm_tags)
         chunk[COL_INV_VAR] = chunk[COL_INV_VAR].apply(fint)
         chunk[COL_INV_TOTAL] = chunk[COL_INV_TOTAL].apply(fint)
@@ -168,11 +198,10 @@ def main():
             for _, r in rows.iterrows():
                 price = float(r["_calc_price"])
 
-                # Инвентарь и политика
                 policy = (str(r.get(COL_INV_POLICY, "")).strip().lower())
                 inv_var = fint(r.get(COL_INV_VAR))
                 inv_tot = fint(r.get(COL_INV_TOTAL))
-                inv = inv_var if inv_var != 0 else inv_tot  # приоритет варианта
+                inv = inv_var if inv_var != 0 else inv_tot
 
                 price_ok = (price > 0) or ALLOW_ZERO_PRICE
                 inv_ok = (inv > 0) or (inv == -1) or (policy == "continue") or INCLUDE_OOS
@@ -218,11 +247,9 @@ def main():
             for pe in personas: by_persona.setdefault(pe, []).append(product_id)
             by_bucket.setdefault(bucket(min_price), []).append(product_id)
 
-    # если ничего не прочитали — сообщим
     if not any_rows:
-        print("No data read from CSV_URL (check direct download/perms).", file=sys.stderr)
+        print("No data read from CSV_URL (check direct link/permissions).", file=sys.stderr)
 
-    # запись
     out_catalog = OUT_DIR / "catalog.min.json"
     out_index = OUT_DIR / "index.min.json"
     with open(out_catalog, "w", encoding="utf-8") as f:
@@ -230,7 +257,6 @@ def main():
     with open(out_index, "w", encoding="utf-8") as f:
         json.dump({"by_tag": by_tag, "by_persona": by_persona, "by_price_bucket": by_bucket}, f, ensure_ascii=False, separators=(",", ":"))
 
-    # вывод путей для workflow + сводка
     print(str(out_catalog))
     print(str(out_index))
     print(

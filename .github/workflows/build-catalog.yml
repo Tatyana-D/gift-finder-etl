@@ -46,38 +46,59 @@ jobs:
           ls -la etl || true
           find . -maxdepth 2 -type f -print
 
-      # НОВОЕ: проверяем, что по ссылке реально отдается файл
+      # ↓↓↓ НОВОЕ: качаем большой файл с Google Drive и подменяем CSV_URL на локальный путь
+      - name: Resolve CSV (Google Drive friendly)
+        run: |
+          set -e
+          echo "Original CSV_URL: $CSV_URL"
+          if echo "$CSV_URL" | grep -q 'drive.google.com/file/d/'; then
+            python -m pip install --quiet gdown
+            FILE_ID=$(echo "$CSV_URL" | sed -n 's#.*drive.google.com/file/d/\([^/]*\)/.*#\1#p')
+            echo "Detected Drive file id: $FILE_ID"
+            gdown --id "$FILE_ID" -O /tmp/catalog.csv
+            ls -lh /tmp/catalog.csv
+            echo "CSV_URL=/tmp/catalog.csv" >> $GITHUB_ENV
+            echo "Replaced CSV_URL with local file."
+          fi
+
       - name: Validate CSV URL
         run: |
           set -e
           echo "CSV_URL=$CSV_URL"
           echo "---- HEAD ----"
-          curl -sSIL "$CSV_URL" || exit 1
+          if echo "$CSV_URL" | grep -q '^/'; then
+            echo "Local file detected, skipping HTTP HEAD"
+          else
+            curl -sSIL "$CSV_URL" || exit 1
+          fi
           echo "---- first 400 bytes ----"
-          curl -sSL "$CSV_URL" | head -c 400 || true
+          if [ -f "$CSV_URL" ]; then
+            head -c 400 "$CSV_URL" || true
+          else
+            curl -sSL "$CSV_URL" | head -c 400 || true
+          fi
           echo
           echo "--------------"
 
-      # НОВОЕ: быстрый предпросмотр колонок и 3 строк
       - name: Peek CSV (columns + 3 rows)
         run: |
           python - << 'PY'
-          import os, pandas as pd
+          import os, pandas as pd, sys
           url = os.environ['CSV_URL']
-          try:
-            df = pd.read_csv(url, nrows=3, dtype=str, keep_default_na=False, sep=None, engine="python", on_bad_lines="skip")
-            ok = True
-          except Exception as e:
-            print("read_csv failed:", e)
-            ok = False
-          if not ok:
+          def preview(u):
             try:
-              df = pd.read_excel(url, dtype=str).head(3)
-              ok = True
+              df = pd.read_csv(u, nrows=3, dtype=str, keep_default_na=False, sep=None, engine="python", on_bad_lines="skip")
+              return df
             except Exception as e:
-              print("read_excel failed:", e)
-              ok = False
-          if ok and not df.empty:
+              print("read_csv failed:", e, file=sys.stderr)
+              try:
+                df = pd.read_excel(u, dtype=str).head(3)
+                return df
+              except Exception as e2:
+                print("read_excel failed:", e2, file=sys.stderr)
+                return None
+          df = preview(url)
+          if df is not None and not df.empty:
             print("COLUMNS:", list(df.columns))
             print(df.to_string(index=False))
           else:

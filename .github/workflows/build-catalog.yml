@@ -148,19 +148,15 @@ jobs:
           if [ -n "${ASSETS_PREFIX}" ]; then
             ASSET_KEY="assets/${ASSETS_PREFIX}/catalog.min.json"
           fi
-          python - <<PY > /tmp/payload.json
-          import os, json, base64
-          path = os.environ["FILE_PATH"]
-          key = os.environ.get("ASSET_KEY", "assets/catalog.min.json")
-        with open(path, "rb") as f:
-          b64 = base64.b64encode(f.read()).decode()
-          print(json.dumps({"asset":{"key":key,"attachment":b64}}, separators=(",",":")))
-          PY
+          base64 -w 0 "$FILE_PATH" > /tmp/file.b64
+          printf '{"asset":{"key":"%s","attachment":"' "$ASSET_KEY" > /tmp/payload.json
+          cat /tmp/file.b64 >> /tmp/payload.json
+          printf '"}}' >> /tmp/payload.json
           HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
-          "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
-        -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
-        -H "Content-Type: application/json" \
-          --data-binary @/tmp/payload.json)
+            "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
+            -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/payload.json)
           echo "HTTP $HTTP_CODE"
           cat resp.json
           test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload catalog failed" && exit 1)
@@ -174,19 +170,15 @@ jobs:
           if [ -n "${ASSETS_PREFIX}" ]; then
             ASSET_KEY="assets/${ASSETS_PREFIX}/index.min.json"
           fi
-          python - <<PY > /tmp/payload.json
-          import os, json, base64
-          path = os.environ["FILE_PATH"]
-          key = os.environ.get("ASSET_KEY", "assets/index.min.json")
-        with open(path, "rb") as f:
-          b64 = base64.b64encode(f.read()).decode()
-          print(json.dumps({"asset":{"key":key,"attachment":b64}}, separators=(",",":")))
-          PY
+          base64 -w 0 "$FILE_PATH" > /tmp/file.b64
+          printf '{"asset":{"key":"%s","attachment":"' "$ASSET_KEY" > /tmp/payload.json
+          cat /tmp/file.b64 >> /tmp/payload.json
+          printf '"}}' >> /tmp/payload.json
           HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
-          "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
-        -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
-        -H "Content-Type: application/json" \
-          --data-binary @/tmp/payload.json)
+            "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
+            -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/payload.json)
           echo "HTTP $HTTP_CODE"
           cat resp.json
           test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)

@@ -71,42 +71,48 @@ jobs:
             curl -sSIL "$CSV_URL" || exit 1
           fi
           echo "---- first 400 bytes ----"
-          if [ -f "$CSV_URL" ]; then head -c 400 "$CSV_URL" || true
-          else curl -sSL "$CSV_URL" | head -c 400 || true
+          if [ -f "$CSV_URL" ]; then
+            head -c 400 "$CSV_URL" || true
+          else
+            curl -sSL "$CSV_URL" | head -c 400 || true
           fi
-          echo; echo "--------------"
+          echo
+          echo "--------------"
 
       - name: Peek CSV (columns + 3 rows)
         run: |
           python - << 'PY'
           import os, pandas as pd, sys, urllib.request
           def read_head(p, n=4096):
-              if os.path.isfile(p):
-                  with open(p,"rb") as f: return f.read(n)
-              with urllib.request.urlopen(p) as r: return r.read(n)
+            if os.path.isfile(p):
+              with open(p,"rb") as f: return f.read(n)
+            with urllib.request.urlopen(p) as r: return r.read(n)
           def guess(p):
-              head = read_head(p).decode("utf-8", errors="ignore")
-              lines = head.splitlines()
-              skiprows = 0
-              if lines and lines[0].strip().lower().startswith("products"): skiprows = 1
-              header = lines[skiprows] if len(lines)>skiprows else ""
-              sep = ";" if (";" in header and "," not in header) else None
-              return sep, skiprows
+            head = read_head(p).decode("utf-8", errors="ignore")
+            lines = head.splitlines()
+            skiprows = 0
+            if lines and lines[0].strip().lower().startswith("products"):
+              skiprows = 1
+            header = lines[skiprows] if len(lines) > skiprows else ""
+            sep = ";" if (";" in header and "," not in header) else None
+            return sep, skiprows
           url = os.environ['CSV_URL']
           sep, skip = guess(url)
           try:
-              df = pd.read_csv(url, nrows=3, dtype=str, keep_default_na=False,
-                               sep=sep, skiprows=skip, engine="python", on_bad_lines="skip")
+            df = pd.read_csv(url, nrows=3, dtype=str, keep_default_na=False,
+                             sep=sep, skiprows=skip, engine="python", on_bad_lines="skip")
           except Exception as e:
-              print("read_csv failed:", e, file=sys.stderr)
-              try:
-                  df = pd.read_excel(url, dtype=str).head(3)
-              except Exception as e2:
-                  print("read_excel failed:", e2, file=sys.stderr); df=None
+            print("read_csv failed:", e, file=sys.stderr)
+            try:
+              df = pd.read_excel(url, dtype=str).head(3)
+            except Exception as e2:
+              print("read_excel failed:", e2, file=sys.stderr)
+              df = None
           if df is not None and not df.empty:
-              print("COLUMNS:", list(df.columns)); print(df.to_string(index=False))
+            print("COLUMNS:", list(df.columns))
+            print(df.to_string(index=False))
           else:
-              print("CSV preview empty or failed.")
+            print("CSV preview empty or failed.")
           PY
 
       - name: Verify env + ETL exists
@@ -119,7 +125,8 @@ jobs:
         run: |
           set -euo pipefail
           python "$GITHUB_WORKSPACE/etl/preprocess_catalog.py" > etl_output.txt
-          echo "ETL output paths:"; cat etl_output.txt
+          echo "ETL output paths:"
+          cat etl_output.txt
 
       - name: Parse ETL output paths
         id: paths
@@ -132,48 +139,54 @@ jobs:
           test -f "$CATALOG" || (echo "ERROR: catalog.min.json not produced at $CATALOG" && exit 1)
           test -f "$INDEX" || (echo "ERROR: index.min.json not produced at $INDEX" && exit 1)
 
-      # -------- Upload using payload file (avoids "Argument list too long") ----------
       - name: Upload catalog.min.json to Shopify assets
         env:
           FILE_PATH: ${{ steps.paths.outputs.catalog_path }}
         run: |
           set -euo pipefail
           ASSET_KEY="assets/catalog.min.json"
-          if [ -n "${ASSETS_PREFIX}" ]; then ASSET_KEY="assets/${ASSETS_PREFIX}/catalog.min.json"; fi
+          if [ -n "${ASSETS_PREFIX}" ]; then
+            ASSET_KEY="assets/${ASSETS_PREFIX}/catalog.min.json"
+          fi
           python - <<PY > /tmp/payload.json
-  import os, json, base64
-  path = os.environ["FILE_PATH"]; key = os.environ["ASSET_KEY"]
-with open(path, "rb") as f:
-  b64 = base64.b64encode(f.read()).decode()
-  print(json.dumps({"asset":{"key":key,"attachment":b64}}, separators=(",",":")))
-  PY
-  HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
-  "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
--H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
--H "Content-Type: application/json" \
-  --data-binary @/tmp/payload.json)
-  echo "HTTP $HTTP_CODE"; cat resp.json
-  test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload catalog failed" && exit 1)
+          import os, json, base64
+          path = os.environ["FILE_PATH"]
+          key = os.environ.get("ASSET_KEY", "assets/catalog.min.json")
+        with open(path, "rb") as f:
+          b64 = base64.b64encode(f.read()).decode()
+          print(json.dumps({"asset":{"key":key,"attachment":b64}}, separators=(",",":")))
+          PY
+          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
+          "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
+        -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
+        -H "Content-Type: application/json" \
+          --data-binary @/tmp/payload.json)
+          echo "HTTP $HTTP_CODE"
+          cat resp.json
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload catalog failed" && exit 1)
 
-- name: Upload index.min.json to Shopify assets
-  env:
-    FILE_PATH: ${{ steps.paths.outputs.index_path }}
-  run: |
-    set -euo pipefail
-    ASSET_KEY="assets/index.min.json"
-    if [ -n "${ASSETS_PREFIX}" ]; then ASSET_KEY="assets/${ASSETS_PREFIX}/index.min.json"; fi
-    python - <<PY > /tmp/payload.json
-  import os, json, base64
-  path = os.environ["FILE_PATH"]; key = os.environ["ASSET_KEY"]
-with open(path, "rb") as f:
-  b64 = base64.b64encode(f.read()).decode()
-  print(json.dumps({"asset":{"key":key,"attachment":b64}}, separators=(",",":")))
-  PY
-  HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
-  "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
--H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
--H "Content-Type: application/json" \
-  --data-binary @/tmp/payload.json)
-  echo "HTTP $HTTP_CODE"; cat resp.json
-  test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)
-# -------------------------------------------------------------------------------
+      - name: Upload index.min.json to Shopify assets
+        env:
+          FILE_PATH: ${{ steps.paths.outputs.index_path }}
+        run: |
+          set -euo pipefail
+          ASSET_KEY="assets/index.min.json"
+          if [ -n "${ASSETS_PREFIX}" ]; then
+            ASSET_KEY="assets/${ASSETS_PREFIX}/index.min.json"
+          fi
+          python - <<PY > /tmp/payload.json
+          import os, json, base64
+          path = os.environ["FILE_PATH"]
+          key = os.environ.get("ASSET_KEY", "assets/index.min.json")
+        with open(path, "rb") as f:
+          b64 = base64.b64encode(f.read()).decode()
+          print(json.dumps({"asset":{"key":key,"attachment":b64}}, separators=(",",":")))
+          PY
+          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
+          "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
+        -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
+        -H "Content-Type: application/json" \
+          --data-binary @/tmp/payload.json)
+          echo "HTTP $HTTP_CODE"
+          cat resp.json
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)

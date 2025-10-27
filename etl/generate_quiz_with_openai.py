@@ -11,7 +11,7 @@ Usage:
 
 ENV:
   OPENAI_API_KEY (required)
-  OPENAI_MODEL   (optional) default: "gpt-4.1-mini"
+  OPENAI_MODEL   (optional, default: gpt-4.1-mini or gpt-4o-mini / gpt-4-turbo)
 """
 
 import os
@@ -20,7 +20,7 @@ import time
 import argparse
 from pathlib import Path
 
-from jsonschema import validate
+from jsonschema import validate, ValidationError
 from openai import OpenAI
 
 # -------------------- JSON schema --------------------
@@ -43,7 +43,7 @@ QUIZ_SCHEMA = {
     },
     "quiz": {
       "type": "array",
-      "minItems": 3,
+      "minItems": 1,
       "maxItems": 10,
       "items": {
         "type": "object",
@@ -86,114 +86,63 @@ QUIZ_SCHEMA = {
   }
 }
 
-# -------------------- Prompts --------------------
 SYSTEM_HINT = (
-  "You are the Gift Finder Quiz Master for an e-commerce store. "
-  "Use ONLY the provided product catalogue JSON. "
-  "Goal: Create a short multiple-choice quiz (3-10 questions, each with 4 options) "
-  "to infer a persona and pick one in-stock product. "
-  "Return STRICT JSON per schema. No markdown, no commentary."
+  "You are the Gift Finder Quiz Master for an ecommerce site. "
+  "You must ONLY use the provided JSON product catalogue. "
+  "Create a multiple-choice quiz (max 10 questions, 4 options each) that infers a persona "
+  "and select ONE in-stock product that fits that persona. "
+  "Return STRICT JSON that matches the provided schema. No markdown, no prose, only JSON."
 )
 
-USER_PROMPT_TEMPLATE = """\
-Source Data Requirement: Use ONLY the provided JSON array of products with fields:
-- id, title, type, tags, status, published, price, inventory_qty, image, body_html
+USER_PROMPT_TMPL = """\
+SOURCE DATA (compact products JSON):
+{catalog_json}
 
-Core Rules:
-- Stock Priority: recommend only products with inventory_qty > 0.
-- Search/Matching: use title, body_html, type, tags.
-- Persona Mapping: map answers to personas and ensure the final product fits.
-- Keep questions concise and storefront-safe.
-- Currency: preserve the symbol present in data (€, £, etc). If unknown, use €.
+Rules:
+- Stock Priority: recommend a product only if inventory_qty > 0.
+- Use title, body_html, type, tags to reason about personas.
+- Keep questions short and storefront-safe.
+- Currency: use the symbol present in price context (€, £ etc). If unclear, prefer €.
+- Return valid JSON only (no comments, no markdown).
+- Aim for 5–10 questions if possible.
 
-Output JSON shape:
-{{
-  "personas": [{{"id":"host","name":"Elegant Host"}}, ... (max 20)],
-  "quiz": [
-    {{
-      "id":"q1","text":"...","type":"single",
-      "options":[
-        {{"id":"a","label":"..."}},
-        {{"id":"b","label":"..."}},
-        {{"id":"c","label":"..."}},
-        {{"id":"d","label":"..."}}
-      ],
-      "weights": {{ "a":{{"host":2}}, "b":{{"cozy":2}} }}  // optional
-    }}
-  ],
-  "analysis_example":"...",
-  "recommendation_logic":"...",
-  "recommended_product":{{
-    "id":"...", "name":"...", "image":"...", "price":"€..", "stock":"In Stock (Qty: ..)"
-  }}
-}}
-
-CATALOG_SNIPPET (first {n} items):
-{snippet}
+Output JSON must match this shape exactly:
+{schema_json}
 """
 
-# -------------------- Helpers --------------------
+# -------------------- helpers --------------------
 def load_ai_catalog(path: str, max_items: int = 300):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return data[:max_items]
 
-def call_openai(api_key: str, model_name: str, snippet_json: str, limit: int) -> str:
+def ask_openai(model: str, api_key: str, system_hint: str, user_prompt: str) -> str:
     client = OpenAI(api_key=api_key)
-    user_prompt = USER_PROMPT_TEMPLATE.format(n=limit, snippet=snippet_json)
-    resp = client.responses.create(
-        model=(model_name or "gpt-4.1-mini"),
-        input=[{"role":"system","content":SYSTEM_HINT},
-               {"role":"user","content":user_prompt}],
+    # Используем chat.completions для совместимости со «старыми» версиями SDK
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_hint},
+            {"role": "user", "content": user_prompt}
+        ],
         temperature=0.4,
         top_p=0.9,
-        max_output_tokens=2000,
-        response_format={"type":"json_object"}  # просим строгий JSON
+        max_tokens=2000,
     )
-    # В Responses API текст лежит в content[0].text
-    return resp.output_text
+    return resp.choices[0].message.content
 
-# -------------------- Entry --------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--catalog_ai", required=True, help="Path to ./out/catalog_for_ai.json")
-    parser.add_argument("--out", required=True, help="Path to write ./out/quiz_output.json")
-    args = parser.parse_args()
+def try_parse_and_validate(txt: str):
+    data = json.loads(txt)
+    validate(instance=data, schema=QUIZ_SCHEMA)
+    return data
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("ERROR: OPENAI_API_KEY is missing")
-        raise SystemExit(1)
-
-    model_name = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
-    items = load_ai_catalog(args.catalog_ai, max_items=300)
-    snippet_json = json.dumps(items, ensure_ascii=False)
-    limit = min(300, len(items))
-
-    attempts = 3
-    last_err = None
-    for _ in range(attempts):
-        try:
-            raw = call_openai(api_key, model_name, snippet_json, limit)
-            data = json.loads(raw)
-            validate(instance=data, schema=QUIZ_SCHEMA)
-
-            # Safety: если внезапно нет вопросов, провалимся в fallback
-            if not data.get("quiz"):
-                raise ValueError("empty quiz")
-
-            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-            with open(args.out, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-            print(f"quiz_output.json generated with {len(data.get('quiz', []))} questions.")
-            return
-        except Exception as e:
-            last_err = e
-            time.sleep(2)
-
-    # Fallback if model fails
-    fallback = {
-      "personas":[{"id":"general","name":"General"}],
+def build_fallback():
+    return {
+      "personas":[
+        {"id":"general","name":"General"},
+        {"id":"cozy","name":"Cozy Homebody"},
+        {"id":"tech","name":"Tech Enthusiast"}
+      ],
       "quiz":[
         {"id":"budget","text":"What's your budget?","type":"single","options":[
           {"id":"u30","label":"Under €30"},
@@ -206,10 +155,71 @@ def main():
       "recommendation_logic":"Fallback used.",
       "recommended_product":{"id":"","name":"","image":"","price":"€0","stock":"In Stock (Qty: 0)"}
     }
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(fallback, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"[fallback] quiz_output.json created. Last error: {last_err}")
+
+# -------------------- main --------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--catalog_ai", required=True, help="Path to ./out/catalog_for_ai.json")
+    parser.add_argument("--out", required=True, help="Path to write ./out/quiz_output.json")
+    args = parser.parse_args()
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("ERROR: OPENAI_API_KEY is missing")
+        raise SystemExit(1)
+    model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+
+    items = load_ai_catalog(args.catalog_ai, max_items=300)
+    catalog_json = json.dumps(items, ensure_ascii=False)
+    schema_json = json.dumps(QUIZ_SCHEMA, ensure_ascii=False)
+
+    user_prompt = USER_PROMPT_TMPL.format(
+        catalog_json=catalog_json,
+        schema_json=schema_json
+    )
+
+    attempts = 3
+    last_err = None
+    data = None
+    for _ in range(attempts):
+        try:
+            raw = ask_openai(model, api_key, SYSTEM_HINT, user_prompt)
+            data = try_parse_and_validate(raw)
+            break
+        except (ValidationError, json.JSONDecodeError) as e:
+            last_err = e
+            # Вторая попытка: попросим исправить JSON (без schema-tools)
+            try:
+                fix_prompt = (
+                    "The previous JSON didn't match the schema. "
+                    "Please return a corrected JSON ONLY, matching this schema strictly:\n"
+                    f"{schema_json}\n\n"
+                    "Previous output:\n"
+                    f"{raw}"
+                )
+                raw2 = ask_openai(model, api_key, SYSTEM_HINT, fix_prompt)
+                data = try_parse_and_validate(raw2)
+                break
+            except Exception as e2:
+                last_err = e2
+                time.sleep(2)
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if data is None:
+        fb = build_fallback()
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(fb, f, ensure_ascii=False, separators=(",", ":"))
+        print(f"[fallback] quiz_output.json created. Last error: {last_err}")
+        return
+
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+    print(f"quiz_output.json generated with {len(data.get('quiz', []))} questions and {len(data.get('personas', []))} personas.")
 
 if __name__ == "__main__":
     main()

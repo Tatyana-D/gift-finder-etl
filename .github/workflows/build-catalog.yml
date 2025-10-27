@@ -23,6 +23,7 @@ jobs:
       ASSETS_PREFIX: ${{ github.event.inputs.assets_prefix || secrets.ASSETS_PREFIX }}
       INCLUDE_OOS: '1'
       ALLOW_ZERO_PRICE: '0'
+      GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
 
     steps:
       - name: Checkout
@@ -36,7 +37,8 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r etl/requirements.txt
+          # твои зависимости + для Google Gemini и JSONSchema + gdown
+          pip install -r etl/requirements.txt google-generativeai==0.7.2 jsonschema==4.22.0 gdown
 
       - name: Show repo tree
         run: |
@@ -51,7 +53,6 @@ jobs:
           set -e
           echo "Original CSV_URL: $CSV_URL"
           if echo "$CSV_URL" | grep -q 'drive.google.com/file/d/'; then
-            python -m pip install --quiet gdown
             FILE_ID=$(echo "$CSV_URL" | sed -n 's#.*drive.google.com/file/d/\([^/]*\)/.*#\1#p')
             echo "Detected Drive file id: $FILE_ID"
             gdown --id "$FILE_ID" -O /tmp/catalog.csv
@@ -119,7 +120,7 @@ jobs:
         run: |
           test -n "$CSV_URL" || (echo "ERROR: CSV_URL is empty. Set repository secret CSV_URL or pass input." && exit 1)
           test -f etl/preprocess_catalog.py || (echo "ERROR: etl/preprocess_catalog.py not found" && exit 1)
-          test -f etl/personas.json || (echo "ERROR: etl/personas.json not found" && exit 1)
+          test -f etl/personas.json || (echo "WARNING: personas.json not found (ok if not used)" && true)
 
       - name: Run ETL
         run: |
@@ -138,6 +139,108 @@ jobs:
           echo "index_path=$INDEX" >> $GITHUB_OUTPUT
           test -f "$CATALOG" || (echo "ERROR: catalog.min.json not produced at $CATALOG" && exit 1)
           test -f "$INDEX" || (echo "ERROR: index.min.json not produced at $INDEX" && exit 1)
+
+      # ---------- NEW: Compact dataset for Gemini ----------
+      - name: Build compact AI catalog (catalog_for_ai.json)
+        run: |
+          python - << 'PY'
+          import os, json, pandas as pd, sys, urllib.request, math, re
+          url = os.environ['CSV_URL']
+          def read_head(p, n=4096):
+            if os.path.isfile(p):
+              with open(p,"rb") as f: return f.read(n)
+            with urllib.request.urlopen(p) as r: return r.read(n)
+          head = read_head(url).decode('utf-8', errors='ignore')
+          lines = head.splitlines()
+          skip = 1 if (lines and lines[0].strip().lower().startswith('products')) else 0
+          sep = ';' if (';' in (lines[skip] if len(lines)>skip else '') and ',' not in (lines[skip] if len(lines)>skip else '')) else None
+
+          def load_df():
+            try:
+              return pd.read_csv(url, dtype=str, keep_default_na=False, sep=sep, skiprows=skip, engine='python', on_bad_lines='skip')
+            except Exception as e:
+              try:
+                return pd.read_excel(url, dtype=str)
+              except Exception as e2:
+                print('Failed to read catalogue for AI', e, e2, file=sys.stderr)
+                sys.exit(1)
+
+          df = load_df()
+
+          def pick(colnames):
+            for c in colnames:
+              if c in df.columns: return c
+            return None
+
+          col_id  = pick(['ID','Handle'])
+          col_tit = pick(['Title'])
+          col_typ = pick(['Type','Product Type'])
+          col_tag = pick(['Tags'])
+          col_sta = pick(['Status'])
+          col_pub = pick(['Published'])
+          col_pri = pick(['Variant Price','Price'])
+          col_inv = pick(['Total Inventory Qty','Variant Inventory Qty'])
+          col_img = pick(['Image Src','Image'])
+          col_bod = pick(['Body HTML','Body'])
+
+          if not col_id or not col_tit:
+            print('Missing required columns (ID/Handle or Title)', file=sys.stderr); sys.exit(1)
+
+          def ffloat(x):
+            s = str(x or '').strip()
+            if not s: return ''
+            s = re.sub(r'[^0-9,.-]','',s)
+            if ',' in s and '.' in s and s.rfind(',')>s.rfind('.'):
+              s = s.replace('.','').replace(',', '.')
+            else:
+              s = s.replace(',', '.')
+            try:
+              return str(round(float(s),2))
+            except: return ''
+
+          def fint(x):
+            try:
+              s = str(x or '').strip()
+              if not s: return 0
+              s = s.replace(',', '.')
+              return int(float(s))
+            except: return 0
+
+          out = []
+          for _, r in df.head(5000).iterrows():  # ограничим разумно
+            item = {
+              'id':     str(r.get(col_id,'')),
+              'title':  r.get(col_tit,''),
+              'type':   r.get(col_typ,''),
+              'tags':   [t.strip() for t in str(r.get(col_tag,'')).split(',') if t.strip()],
+              'status': r.get(col_sta,''),
+              'published': r.get(col_pub,''),
+              'price':  ffloat(r.get(col_pri,'')),
+              'inventory_qty': fint(r.get(col_inv,'')),
+              'image':  r.get(col_img,''),
+              'body_html': r.get(col_bod,'')
+            }
+            if item['id'] and item['title']:
+              out.append(item)
+
+          import pathlib
+          pathlib.Path('out').mkdir(exist_ok=True)
+          with open('out/catalog_for_ai.json','w',encoding='utf-8') as f:
+            json.dump(out, f, ensure_ascii=False, separators=(',',':'))
+          print(f"Wrote out/catalog_for_ai.json with {len(out)} rows")
+          PY
+
+      - name: Generate quiz with Gemini
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          python etl/generate_quiz_with_gemini.py \
+            --catalog_ai ./out/catalog_for_ai.json \
+            --out ./out/quiz_output.json
+          ls -lh ./out/quiz_output.json
+          head -c 400 ./out/quiz_output.json || true
+          echo
 
       - name: Upload catalog.min.json to Shopify assets
         env:
@@ -182,3 +285,24 @@ jobs:
           echo "HTTP $HTTP_CODE"
           cat resp.json
           test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)
+
+      # ---------- NEW: upload quiz_output.json ----------
+      - name: Upload quiz_output.json to Shopify assets
+        run: |
+          set -euo pipefail
+          ASSET_KEY="assets/quiz.json"
+          if [ -n "${ASSETS_PREFIX}" ]; then
+            ASSET_KEY="assets/${ASSETS_PREFIX}/quiz.json"
+          fi
+          base64 -w 0 "./out/quiz_output.json" > /tmp/file.b64
+          printf '{"asset":{"key":"%s","attachment":"' "$ASSET_KEY" > /tmp/payload.json
+          cat /tmp/file.b64 >> /tmp/payload.json
+          printf '"}}' >> /tmp/payload.json
+          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X PUT \
+            "https://${SHOPIFY_STORE}/admin/api/2024-10/themes/${THEME_ID}/assets.json" \
+            -H "X-Shopify-Access-Token: ${SHOPIFY_ADMIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/payload.json)
+          echo "HTTP $HTTP_CODE"
+          cat resp.json
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload quiz failed" && exit 1)

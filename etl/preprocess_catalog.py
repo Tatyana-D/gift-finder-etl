@@ -1,4 +1,4 @@
-import os, json, math, sys, re, io
+import os, json, math, sys, re
 import pandas as pd
 from pathlib import Path
 from slugify import slugify
@@ -10,26 +10,25 @@ ALLOW_ZERO_PRICE = os.environ.get("ALLOW_ZERO_PRICE", "0") == "1"
 OUT_DIR = Path("./out")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-PERSONAS_PATH = Path(__file__).parent / "personas.json"
-with open(PERSONAS_PATH, "r", encoding="utf-8") as f:
-    PERSONA_RULES = json.load(f)
-
-# ---- column names (под твой экспорт) ----
-COL_HANDLE = "Handle"
-COL_TITLE = "Title"
-COL_VENDOR = "Vendor"
-COL_TAGS = "Tags"
-COL_DESC = "Body HTML"
-COL_IMG = "Image Src"
+# ---- CSV column names (Shopify export) ----
+COL_HANDLE   = "Handle"
+COL_TITLE    = "Title"
+COL_VENDOR   = "Vendor"
+COL_TAGS     = "Tags"
+COL_DESC     = "Body HTML"
+COL_IMG      = "Image Src"
+COL_TYPE     = "Type"
+COL_STATUS   = "Status"
+COL_PUBLISHED= "Published"
 
 PRICE_CANDIDATES = ["Variant Price", "Variant Compare At Price", "Price"]
 
-COL_INV_VAR = "Variant Inventory Qty"
+COL_INV_VAR   = "Variant Inventory Qty"
 COL_INV_TOTAL = "Total Inventory Qty"
-COL_INV_POLICY = "Variant Inventory Policy"
+COL_INV_POLICY= "Variant Inventory Policy"
 
-COL_VID = "Variant ID"
-COL_VSKU = "Variant SKU"
+COL_VID   = "Variant ID"
+COL_VSKU  = "Variant SKU"
 COL_OPT1V = "Option1 Value"
 COL_OPT2V = "Option2 Value"
 COL_OPT3V = "Option3 Value"
@@ -72,28 +71,11 @@ def fint(x):
     except:
         return 0
 
-def map_personas(text, tags):
-    hay = (text or "").lower() + " " + " ".join(tags or [])
-    res = set()
-    for persona, kws in PERSONA_RULES.items():
-        if any(kw.lower() in hay for kw in kws):
-            res.add(persona)
-    return sorted(res)
-
-def pick_price(row):
-    for col in PRICE_CANDIDATES:
-        if col in row and str(row[col]).strip() != "":
-            val = ffloat_any(row[col]);
-            if val > 0: return val
-    return ffloat_any(row.get(PRICE_CANDIDATES[0], 0))
-
-# -------- NEW: автоопределение формата Shopify CSV ----------
+# --- sniff Shopify CSV (Products header + ';' delimiter) ---
 def _read_head_bytes(path_or_url, n=4096):
-    # локальный файл?
     if os.path.isfile(path_or_url):
         with open(path_or_url, "rb") as f:
             return f.read(n)
-    # URL
     try:
         import urllib.request
         with urllib.request.urlopen(path_or_url) as r:
@@ -102,27 +84,20 @@ def _read_head_bytes(path_or_url, n=4096):
         return b""
 
 def guess_csv_params(path_or_url):
-    """Возвращает dict с параметрами для pd.read_csv: sep, skiprows."""
     head = _read_head_bytes(path_or_url).decode("utf-8", errors="ignore")
     lines = head.splitlines()
     sep = None
     skiprows = 0
-
-    # Shopify CSV часто начинаетcя строкой 'Products'
     if lines and lines[0].strip().lower().startswith("products"):
         skiprows = 1
-
-    # Заголовок обычно во второй строке, если была 'Products'
     header_line = lines[skiprows] if len(lines) > skiprows else ""
     if ";" in header_line and "," not in header_line:
         sep = ";"
     else:
-        sep = None  # пусть pandas сам попробует
-
+        sep = None
     return {"sep": sep, "skiprows": skiprows}
 
 def iter_frames(url):
-    # сначала пробуем как CSV с угаданными параметрами
     params = guess_csv_params(url)
     try:
         for chunk in pd.read_csv(
@@ -139,7 +114,6 @@ def iter_frames(url):
         return
     except Exception as e:
         print(f"[info] read_csv failed, trying Excel: {e}", file=sys.stderr)
-    # fallback: Excel
     try:
         xls = pd.read_excel(url, dtype=str)
         yield xls
@@ -147,7 +121,20 @@ def iter_frames(url):
     except Exception as e:
         print(f"[error] read_excel failed: {e}", file=sys.stderr)
         return
-# ------------------------------------------------------------
+
+def pick_price(row):
+    for col in PRICE_CANDIDATES:
+        if col in row and str(row[col]).strip() != "":
+            val = ffloat_any(row[col])
+            if val > 0: return val
+    return ffloat_any(row.get(PRICE_CANDIDATES[0], 0))
+
+def clean_html(s, maxlen=500):
+    if not s: return ""
+    # грубая чистка html-тегов
+    txt = re.sub(r"<[^>]+>", " ", str(s))
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return (txt[:maxlen] + "…") if len(txt) > maxlen else txt
 
 def main():
     if not CSV_URL:
@@ -155,9 +142,12 @@ def main():
         sys.exit(1)
 
     catalog = []
-    by_tag, by_persona, by_bucket = {}, {}, {}
+    by_tag, by_bucket = {}, {}
     total_rows = total_products = kept_products = kept_variants = 0
     any_rows = False
+
+    # для файла для AI
+    ai_rows = []
 
     for chunk in iter_frames(CSV_URL):
         any_rows = True
@@ -165,6 +155,7 @@ def main():
 
         must_cols = [
             COL_HANDLE, COL_TITLE, COL_VENDOR, COL_TAGS, COL_DESC, COL_IMG,
+            COL_TYPE, COL_STATUS, COL_PUBLISHED,
             COL_VID, COL_VSKU, COL_OPT1V, COL_OPT2V, COL_OPT3V,
             COL_INV_VAR, COL_INV_TOTAL, COL_INV_POLICY
         ] + PRICE_CANDIDATES
@@ -191,21 +182,29 @@ def main():
             desc = first[COL_DESC]
             primary_image = first.get(COL_IMG, "")
             tags = sorted(set(t for lst in rows[COL_TAGS].tolist() for t in lst))
+            ptype = first.get(COL_TYPE, "")
+            status = (first.get(COL_STATUS, "") or "").lower()
+            published = str(first.get(COL_PUBLISHED, "")).strip().lower() in ("true","1","yes")
 
             variants = []
             min_price = 9e9
 
+            # вычислим суммарный/макс остаток для продукта
+            total_inv_seen = 0
+            max_inv_seen = 0
+
             for _, r in rows.iterrows():
                 price = float(r["_calc_price"])
-
                 policy = (str(r.get(COL_INV_POLICY, "")).strip().lower())
                 inv_var = fint(r.get(COL_INV_VAR))
                 inv_tot = fint(r.get(COL_INV_TOTAL))
                 inv = inv_var if inv_var != 0 else inv_tot
 
+                total_inv_seen += max(inv, 0)
+                if inv > max_inv_seen: max_inv_seen = inv
+
                 price_ok = (price > 0) or ALLOW_ZERO_PRICE
                 inv_ok = (inv > 0) or (inv == -1) or (policy == "continue") or INCLUDE_OOS
-
                 if not (price_ok and inv_ok):
                     continue
 
@@ -223,42 +222,62 @@ def main():
                     min_price = price
 
             if not variants:
-                continue
+                # даже если не берём в итоговый каталог (нет валидных вариантов),
+                # всё равно сформируем строку для AI, чтобы он знал про ассортимент
+                pass
+            else:
+                if min_price == 9e9:
+                    min_price = min((v["price"] for v in variants), default=0.0)
 
-            if min_price == 9e9:
-                min_price = min((v["price"] for v in variants), default=0.0)
+                product = {
+                    "product_id": product_id,
+                    "handle": handle,
+                    "title": title,
+                    "vendor": vendor,
+                    "tags": tags,
+                    "price": round(min_price, 2),
+                    "currency": "EUR",
+                    "primary_image": primary_image,
+                    "variants": variants
+                }
+                catalog.append(product); kept_products += 1
 
-            personas = map_personas(f"{title} {desc}", tags)
-            product = {
-                "product_id": product_id,
-                "handle": handle,
+                for t in tags: by_tag.setdefault(t, []).append(product_id)
+                by_bucket.setdefault(bucket(min_price), []).append(product_id)
+
+            # строка для AI — всегда (даже если variants пусто)
+            ai_rows.append({
+                "id": product_id,
                 "title": title,
-                "vendor": vendor,
+                "type": ptype,
                 "tags": tags,
-                "persona": personas,
-                "price": round(min_price, 2),
-                "currency": "EUR",
-                "primary_image": primary_image,
-                "variants": variants
-            }
-            catalog.append(product); kept_products += 1
-
-            for t in tags: by_tag.setdefault(t, []).append(product_id)
-            for pe in personas: by_persona.setdefault(pe, []).append(product_id)
-            by_bucket.setdefault(bucket(min_price), []).append(product_id)
+                "status": status,
+                "published": bool(published),
+                "price": round(min_price if min_price != 9e9 else pick_price(first), 2) if rows["_calc_price"].notna().any() else 0.0,
+                "inventory_qty": int(max_inv_seen if max_inv_seen > 0 else total_inv_seen),
+                "image": primary_image,
+                "body_html": clean_html(desc, maxlen=500)
+            })
 
     if not any_rows:
         print("No data read from CSV_URL (check direct link/permissions).", file=sys.stderr)
 
     out_catalog = OUT_DIR / "catalog.min.json"
-    out_index = OUT_DIR / "index.min.json"
+    out_index   = OUT_DIR / "index.min.json"
+    out_ai      = OUT_DIR / "catalog_for_ai.json"
+
     with open(out_catalog, "w", encoding="utf-8") as f:
         json.dump(catalog, f, ensure_ascii=False, separators=(",", ":"))
     with open(out_index, "w", encoding="utf-8") as f:
-        json.dump({"by_tag": by_tag, "by_persona": by_persona, "by_price_bucket": by_bucket}, f, ensure_ascii=False, separators=(",", ":"))
+        json.dump({"by_tag": by_tag, "by_price_bucket": by_bucket}, f, ensure_ascii=False, separators=(",", ":"))
+    with open(out_ai, "w", encoding="utf-8") as f:
+        json.dump(ai_rows, f, ensure_ascii=False, separators=(",", ":"))
 
+    # Печатаем пути (3 строки) — их читает workflow:
     print(str(out_catalog))
     print(str(out_index))
+    print(str(out_ai))
+
     print(
         f"SUMMARY rows={total_rows} products_in_csv={total_products} kept_products={kept_products} kept_variants={kept_variants} "
         f"include_oos={INCLUDE_OOS} allow_zero_price={ALLOW_ZERO_PRICE}",

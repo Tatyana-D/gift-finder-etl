@@ -27,7 +27,8 @@ jobs:
       ALLOW_ZERO_PRICE: '0'
       # OpenAI
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4.1-mini' }}
+      # Лучше сразу ставить безопасную «малую» модель
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4o-mini' }}
 
     steps:
       - name: Checkout
@@ -40,9 +41,11 @@ jobs:
 
       - name: Install deps
         run: |
+          set -e
           python -m pip install --upgrade pip
-          pip install -r etl/requirements.txt
-          pip install openai jsonschema gdown
+          # Фиксируем версии, чтобы избежать несовместимостей
+          pip install -r etl/requirements.txt || true
+          pip install --upgrade "openai>=1.10.0" "jsonschema>=4.22.0" "gdown>=5.2.0" pandas python-slugify
 
       - name: Show repo tree
         run: |
@@ -156,7 +159,7 @@ jobs:
           def inv_max(p):
             return max([v.get("inventory", 0) for v in p.get("variants", [])] + [0])
           compact = []
-          for p in data[:1500]:  # ограничим объём для модели
+          for p in data[:1500]:
             compact.append({
               "id": p.get("product_id") or p.get("handle"),
               "title": p.get("title"),
@@ -167,7 +170,7 @@ jobs:
               "price": p.get("price"),
               "inventory_qty": inv_max(p),
               "image": p.get("primary_image"),
-              "body_html": ""  # опционально можно обрезать/добавить
+              "body_html": ""
             })
           dst.parent.mkdir(parents=True, exist_ok=True)
           with dst.open("w", encoding="utf-8") as f:
@@ -179,9 +182,15 @@ jobs:
       - name: Generate quiz with OpenAI
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4.1-mini' }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4o-mini' }}
         run: |
           set -euo pipefail
+          python - <<'PY'
+          import openai, sys
+          print("openai version:", getattr(openai, "__version__", "unknown"))
+          PY
+          echo "=== Head of etl/generate_quiz_with_openai.py ==="
+          sed -n '1,60p' etl/generate_quiz_with_openai.py || true
           python etl/generate_quiz_with_openai.py \
             --catalog_ai ./out/catalog_for_ai.json \
             --out ./out/quiz_output.json

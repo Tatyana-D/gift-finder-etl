@@ -16,13 +16,18 @@ jobs:
     permissions:
       contents: read
     env:
+      # Shopify
       SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
       SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
       THEME_ID: ${{ secrets.THEME_ID }}
+      # Data inputs
       CSV_URL: ${{ github.event.inputs.csv_url || secrets.CSV_URL }}
       ASSETS_PREFIX: ${{ github.event.inputs.assets_prefix || secrets.ASSETS_PREFIX }}
       INCLUDE_OOS: '1'
       ALLOW_ZERO_PRICE: '0'
+      # Gemini
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      GEMINI_MODEL: gemini-1.5-pro
 
     steps:
       - name: Checkout
@@ -119,7 +124,6 @@ jobs:
         run: |
           test -n "$CSV_URL" || (echo "ERROR: CSV_URL is empty. Set repository secret CSV_URL or pass input." && exit 1)
           test -f etl/preprocess_catalog.py || (echo "ERROR: etl/preprocess_catalog.py not found" && exit 1)
-          test -f etl/personas.json || (echo "INFO: personas.json not found (ok if you moved to Gemini)") || true
 
       - name: Run ETL
         run: |
@@ -138,24 +142,52 @@ jobs:
           echo "index_path=$INDEX" >> $GITHUB_OUTPUT
           test -f "$CATALOG" || (echo "ERROR: catalog.min.json not produced at $CATALOG" && exit 1)
           test -f "$INDEX" || (echo "ERROR: index.min.json not produced at $INDEX" && exit 1)
-          # Дополнительно проверим лёгкий каталог для AI
-          test -f "out/catalog_for_ai.json" || echo "WARNING: out/catalog_for_ai.json missing (Gemini will fail)"
 
-      # ---------- Gemini: generate quiz.json ----------
-      - name: Generate quiz with Gemini
-        env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+      # --- Compact AI dataset for LLM (safe, minimized) ---
+      - name: Build compact AI catalog
         run: |
           set -euo pipefail
-          test -f out/catalog_for_ai.json || (echo "catalog_for_ai.json missing" && exit 1)
+          python - <<'PY'
+          import json, pathlib
+          src = pathlib.Path("${{ steps.paths.outputs.catalog_path }}")
+          dst = pathlib.Path("out/catalog_for_ai.json")
+          with src.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+          # keep only fields, limit length of text fields
+          def trim(s, n=1200):
+            s = (s or "")
+            return s[:n]
+          compact = []
+          for p in data:
+            compact.append({
+              "id": p.get("product_id") or p.get("handle"),
+              "title": p.get("title"),
+              "type": " / ".join(p.get("tags", [])[:3]),
+              "tags": p.get("tags", [])[:10],
+              "status": "active",
+              "published": True,
+              "price": p.get("price"),
+              "inventory_qty": max([v.get("inventory", 0) for v in p.get("variants", [])] + [0]),
+              "image": p.get("primary_image"),
+              "body_html": trim("")
+            })
+          dst.parent.mkdir(parents=True, exist_ok=True)
+          with dst.open("w", encoding="utf-8") as f:
+            json.dump(compact, f, ensure_ascii=False, separators=(",",":"))
+          print(f"Wrote {dst} with {len(compact)} rows")
+          PY
+
+      # --- Generate quiz with Gemini ---
+      - name: Generate quiz with Gemini
+        run: |
+          set -euo pipefail
           python etl/generate_quiz_with_gemini.py \
             --catalog_ai ./out/catalog_for_ai.json \
             --out ./out/quiz_output.json
-          echo "---- quiz_output.json (head) ----"
-          head -c 800 out/quiz_output.json || true
-          echo
+          ls -l out/quiz_output.json
+          head -c 400 out/quiz_output.json || true
 
+      # --- Upload catalog.min.json ---
       - name: Upload catalog.min.json to Shopify assets
         env:
           FILE_PATH: ${{ steps.paths.outputs.catalog_path }}
@@ -178,6 +210,7 @@ jobs:
           cat resp.json
           test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload catalog failed" && exit 1)
 
+      # --- Upload index.min.json ---
       - name: Upload index.min.json to Shopify assets
         env:
           FILE_PATH: ${{ steps.paths.outputs.index_path }}
@@ -200,10 +233,10 @@ jobs:
           cat resp.json
           test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)
 
-      - name: Upload quiz.json to Shopify assets
+      # --- Upload quiz_output.json ---
+      - name: Upload quiz_output.json to Shopify assets
         run: |
           set -euo pipefail
-          test -f "out/quiz_output.json" || (echo "quiz_output.json missing" && exit 1)
           ASSET_KEY="assets/quiz.json"
           if [ -n "${ASSETS_PREFIX}" ]; then
             ASSET_KEY="assets/${ASSETS_PREFIX}/quiz.json"
@@ -219,4 +252,4 @@ jobs:
             --data-binary @/tmp/payload.json)
           echo "HTTP $HTTP_CODE"
           cat resp.json
-          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload quiz.json failed" && exit 1)
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload quiz failed" && exit 1)

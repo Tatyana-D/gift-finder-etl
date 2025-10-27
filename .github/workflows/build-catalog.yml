@@ -25,9 +25,9 @@ jobs:
       ASSETS_PREFIX: ${{ github.event.inputs.assets_prefix || secrets.ASSETS_PREFIX }}
       INCLUDE_OOS: '1'
       ALLOW_ZERO_PRICE: '0'
-      # Gemini
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      GEMINI_MODEL: gemini-1.5-pro
+      # OpenAI
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4.1-mini' }}
 
     steps:
       - name: Checkout
@@ -42,6 +42,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r etl/requirements.txt
+          pip install openai jsonschema gdown
 
       - name: Show repo tree
         run: |
@@ -56,7 +57,6 @@ jobs:
           set -e
           echo "Original CSV_URL: $CSV_URL"
           if echo "$CSV_URL" | grep -q 'drive.google.com/file/d/'; then
-            python -m pip install --quiet gdown
             FILE_ID=$(echo "$CSV_URL" | sed -n 's#.*drive.google.com/file/d/\([^/]*\)/.*#\1#p')
             echo "Detected Drive file id: $FILE_ID"
             gdown --id "$FILE_ID" -O /tmp/catalog.csv
@@ -143,7 +143,7 @@ jobs:
           test -f "$CATALOG" || (echo "ERROR: catalog.min.json not produced at $CATALOG" && exit 1)
           test -f "$INDEX" || (echo "ERROR: index.min.json not produced at $INDEX" && exit 1)
 
-      # --- Compact AI dataset for LLM (safe, minimized) ---
+      # --- Build compact AI catalog (for LLM) ---
       - name: Build compact AI catalog
         run: |
           set -euo pipefail
@@ -153,12 +153,10 @@ jobs:
           dst = pathlib.Path("out/catalog_for_ai.json")
           with src.open("r", encoding="utf-8") as f:
             data = json.load(f)
-          # keep only fields, limit length of text fields
-          def trim(s, n=1200):
-            s = (s or "")
-            return s[:n]
+          def inv_max(p):
+            return max([v.get("inventory", 0) for v in p.get("variants", [])] + [0])
           compact = []
-          for p in data:
+          for p in data[:1500]:  # ограничим объём для модели
             compact.append({
               "id": p.get("product_id") or p.get("handle"),
               "title": p.get("title"),
@@ -167,9 +165,9 @@ jobs:
               "status": "active",
               "published": True,
               "price": p.get("price"),
-              "inventory_qty": max([v.get("inventory", 0) for v in p.get("variants", [])] + [0]),
+              "inventory_qty": inv_max(p),
               "image": p.get("primary_image"),
-              "body_html": trim("")
+              "body_html": ""  # опционально можно обрезать/добавить
             })
           dst.parent.mkdir(parents=True, exist_ok=True)
           with dst.open("w", encoding="utf-8") as f:
@@ -177,17 +175,20 @@ jobs:
           print(f"Wrote {dst} with {len(compact)} rows")
           PY
 
-      # --- Generate quiz with Gemini ---
-      - name: Generate quiz with Gemini
+      # --- Generate quiz with OpenAI ---
+      - name: Generate quiz with OpenAI
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || 'gpt-4.1-mini' }}
         run: |
           set -euo pipefail
-          python etl/generate_quiz_with_gemini.py \
+          python etl/generate_quiz_with_openai.py \
             --catalog_ai ./out/catalog_for_ai.json \
             --out ./out/quiz_output.json
-          ls -l out/quiz_output.json
-          head -c 400 out/quiz_output.json || true
+          echo "---- quiz_output.json (head) ----"
+          head -c 800 out/quiz_output.json || true
+          echo
 
-      # --- Upload catalog.min.json ---
       - name: Upload catalog.min.json to Shopify assets
         env:
           FILE_PATH: ${{ steps.paths.outputs.catalog_path }}
@@ -210,7 +211,6 @@ jobs:
           cat resp.json
           test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload catalog failed" && exit 1)
 
-      # --- Upload index.min.json ---
       - name: Upload index.min.json to Shopify assets
         env:
           FILE_PATH: ${{ steps.paths.outputs.index_path }}
@@ -233,8 +233,7 @@ jobs:
           cat resp.json
           test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)
 
-      # --- Upload quiz_output.json ---
-      - name: Upload quiz_output.json to Shopify assets
+      - name: Upload quiz.json to Shopify assets
         run: |
           set -euo pipefail
           ASSET_KEY="assets/quiz.json"

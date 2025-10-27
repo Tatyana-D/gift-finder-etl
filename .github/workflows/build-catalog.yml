@@ -37,8 +37,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r etl/requirements.txt
-          # для вызова Gemini
-          pip install google-generativeai jsonschema
 
       - name: Show repo tree
         run: |
@@ -121,7 +119,7 @@ jobs:
         run: |
           test -n "$CSV_URL" || (echo "ERROR: CSV_URL is empty. Set repository secret CSV_URL or pass input." && exit 1)
           test -f etl/preprocess_catalog.py || (echo "ERROR: etl/preprocess_catalog.py not found" && exit 1)
-          test -f etl/personas.json || (echo "ERROR: etl/personas.json not found" && exit 1 || true)
+          test -f etl/personas.json || (echo "INFO: personas.json not found (ok if you moved to Gemini)") || true
 
       - name: Run ETL
         run: |
@@ -140,16 +138,23 @@ jobs:
           echo "index_path=$INDEX" >> $GITHUB_OUTPUT
           test -f "$CATALOG" || (echo "ERROR: catalog.min.json not produced at $CATALOG" && exit 1)
           test -f "$INDEX" || (echo "ERROR: index.min.json not produced at $INDEX" && exit 1)
+          # Дополнительно проверим лёгкий каталог для AI
+          test -f "out/catalog_for_ai.json" || echo "WARNING: out/catalog_for_ai.json missing (Gemini will fail)"
 
-      # ETL пишет также ./out/catalog_for_ai.json — используем его для AI
+      # ---------- Gemini: generate quiz.json ----------
       - name: Generate quiz with Gemini
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
         run: |
           set -euo pipefail
-          python etl/generate_quiz_with_gemini.py --catalog_ai ./out/catalog_for_ai.json --out ./out/quiz_output.json || true
-          ls -l ./out/quiz_output.json
-          head -c 300 ./out/quiz_output.json || true
+          test -f out/catalog_for_ai.json || (echo "catalog_for_ai.json missing" && exit 1)
+          python etl/generate_quiz_with_gemini.py \
+            --catalog_ai ./out/catalog_for_ai.json \
+            --out ./out/quiz_output.json
+          echo "---- quiz_output.json (head) ----"
+          head -c 800 out/quiz_output.json || true
+          echo
 
       - name: Upload catalog.min.json to Shopify assets
         env:
@@ -195,17 +200,15 @@ jobs:
           cat resp.json
           test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload index failed" && exit 1)
 
-      # ⬇️ НОВЫЙ ШАГ — загружаем quiz_output.json
-      - name: Upload quiz_output.json to Shopify assets
-        env:
-          FILE_PATH: ./out/quiz_output.json
+      - name: Upload quiz.json to Shopify assets
         run: |
           set -euo pipefail
-          ASSET_KEY="assets/quiz_output.json"
+          test -f "out/quiz_output.json" || (echo "quiz_output.json missing" && exit 1)
+          ASSET_KEY="assets/quiz.json"
           if [ -n "${ASSETS_PREFIX}" ]; then
-            ASSET_KEY="assets/${ASSETS_PREFIX}/quiz_output.json"
+            ASSET_KEY="assets/${ASSETS_PREFIX}/quiz.json"
           fi
-          base64 -w 0 "$FILE_PATH" > /tmp/file.b64
+          base64 -w 0 "out/quiz_output.json" > /tmp/file.b64
           printf '{"asset":{"key":"%s","attachment":"' "$ASSET_KEY" > /tmp/payload.json
           cat /tmp/file.b64 >> /tmp/payload.json
           printf '"}}' >> /tmp/payload.json
@@ -216,4 +219,4 @@ jobs:
             --data-binary @/tmp/payload.json)
           echo "HTTP $HTTP_CODE"
           cat resp.json
-          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload quiz failed" && exit 1)
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300 || (echo "Upload quiz.json failed" && exit 1)
